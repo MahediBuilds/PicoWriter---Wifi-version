@@ -1,140 +1,89 @@
-import time
-import random
-import usb_hid
-import wifi
-import socketpool
-import gc
+import time, random, usb_hid, usb_cdc
 from adafruit_hid.keyboard import Keyboard
-from adafruit_hid.keycode import Keycode
 from adafruit_hid.keyboard_layout_us import KeyboardLayoutUS
-from secrets import secrets
+from adafruit_hid.keycode import Keycode
 
 keyboard = Keyboard(usb_hid.devices)
 layout = KeyboardLayoutUS(keyboard)
+serial = usb_cdc.data
 
-def safe_close(conn):
-    try:
-        conn.close()
-    except Exception:
-        pass
+# --- Behavior tuning ---
+MIN_WPM, MAX_WPM = 10, 50
+WORD_PAUSE_RANGE = (0.5, 1.2)     # pause after each word
+PAUSE_EVERY_N_LINES = 4
+PAUSE_DURATION = 5                # 5s break after every 4 lines
+TYPO_PROBABILITY = 0.015          # 1.5% chance of typo per character
 
-def type_text(text):
-    for c in text:
-        if c == "\n":
-            keyboard.send(Keycode.ENTER)
-        else:
-            try:
-                layout.write(c)
-            except Exception:
-                pass
-        time.sleep(random.uniform(0.04, 0.10))
+def delay_for_char(ch):
+    """Human entropy: random realistic delay per character."""
+    wpm = random.uniform(MIN_WPM, MAX_WPM)
+    cps = (wpm * 5) / 60
+    base = 1 / cps
+    if ch in ".!?":
+        return base * random.uniform(2.0, 2.8)
+    if ch in ",;:":
+        return base * random.uniform(1.5, 2.0)
+    if ch in "()[]{}\"'":
+        return base * random.uniform(1.2, 1.7)
+    if ch == " ":
+        return base * random.uniform(1.0, 1.4)
+    return base * random.uniform(0.7, 1.1)
+
+def read_serial_lines():
+    """Fetch full text from USB serial as list of lines."""
+    data = b""
+    while serial.in_waiting:
+        data += serial.read(serial.in_waiting)
+        time.sleep(0.05)
+    return data.decode("utf-8", "ignore").splitlines() if data else []
+
+def type_code(lines):
+    """Type text without indentation but with realistic entropy."""
+    line_count = 0
+    for line in lines:
+        # Strip indentation completely
+        clean_line = line.lstrip()
+
+        word_buffer = ""
+        for ch in clean_line:
+            # Random typo simulation
+            if random.random() < TYPO_PROBABILITY and ch.isalpha():
+                wrong_char = random.choice("abcdefghijklmnopqrstuvwxyz")
+                layout.write(wrong_char)
+                time.sleep(random.uniform(0.05, 0.25))
+                keyboard.send(Keycode.BACKSPACE)
+                time.sleep(random.uniform(0.05, 0.25))
+
+            # Type actual character
+            layout.write(ch)
+            word_buffer += ch
+            time.sleep(delay_for_char(ch))
+
+            # Pause after words
+            if ch in [" ", "\t"]:
+                if word_buffer.strip():
+                    time.sleep(random.uniform(*WORD_PAUSE_RANGE))
+                word_buffer = ""
+
+        # End of line — add small space, then ENTER
+        layout.write(" ")
+        keyboard.send(Keycode.ENTER)
+        line_count += 1
+
+        # Short pause per line
+        time.sleep(random.uniform(0.4, 1.0))
+
+        # Long pause every few lines
+        if line_count % PAUSE_EVERY_N_LINES == 0:
+            time.sleep(PAUSE_DURATION)
+
     keyboard.send(Keycode.ENTER)
 
-def url_decode(s):
-    out = ""
-    i = 0
-    while i < len(s):
-        if s[i] == "%" and i + 2 < len(s):
-            try:
-                out += chr(int(s[i+1:i+3], 16))
-                i += 3
-                continue
-            except Exception:
-                pass
-        elif s[i] == "+":
-            out += " "
-        else:
-            out += s[i]
-        i += 1
-    return out
+print("Plain-text human entropy typer ready.")
+time.sleep(2)
 
-# === Wi-Fi connection ===
-print("Connecting to Wi-Fi…")
-wifi.radio.enabled = True
-for attempt in range(5):
-    try:
-        wifi.radio.connect(secrets["ssid"], secrets["password"])
-        ip = wifi.radio.ipv4_address
-        print(f"Connected! IP: {ip}")
-        break
-    except Exception as e:
-        print(f"Attempt {attempt + 1} failed: {e}")
-        time.sleep(2)
-else:
-    print("Failed to connect after 5 attempts.")
-    while True:
-        pass
-
-# === HTTP server setup ===
-pool = socketpool.SocketPool(wifi.radio)
-server = pool.socket(pool.AF_INET, pool.SOCK_STREAM)
-server.settimeout(None)
-server.bind(("0.0.0.0", 80))
-server.listen(2)
-print(f"Listening on http://{wifi.radio.ipv4_address}")
-
-# === Activity watchdog ===
-last_request = time.monotonic()
-
-# === Main loop ===
 while True:
-    try:
-        conn, addr = server.accept()
-        conn.settimeout(5)
-
-        data = bytearray(2048)
-        n = conn.recv_into(data)
-        if n == 0:
-            safe_close(conn)
-            continue
-
-        request = data[:n].decode("utf-8", "ignore")
-
-        if "GET /type?" in request:
-            try:
-                text = request.split("text=")[1].split(" ")[0]
-                text = url_decode(text)
-                type_text(text)
-                body = "Typed successfully"
-            except Exception:
-                body = "Error typing"
-        else:
-            body = "PicoW Keyboard Ready"
-
-        response = (
-            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n"
-            + body
-        )
-
-        try:
-            conn.send(response.encode("utf-8"))
-        except Exception:
-            pass
-        safe_close(conn)
-
-        gc.collect()
-        last_request = time.monotonic()
-        time.sleep(0.1)
-
-    except Exception:
-        safe_close(conn)
-        gc.collect()
-        time.sleep(1)
-
-    # --- Watchdog: restart Wi-Fi if idle for too long ---
-    if time.monotonic() - last_request > 60:
-        print("No requests for 60s — restarting Wi-Fi")
-        try:
-            wifi.radio.enabled = False
-            time.sleep(1)
-            wifi.radio.enabled = True
-            wifi.radio.connect(secrets["ssid"], secrets["password"])
-            pool = socketpool.SocketPool(wifi.radio)
-            server = pool.socket(pool.AF_INET, pool.SOCK_STREAM)
-            server.settimeout(None)
-            server.bind(("0.0.0.0", 80))
-            server.listen(2)
-            print(f"Reconnected! IP: {wifi.radio.ipv4_address}")
-        except Exception as e:
-            print(f"Restart failed: {e}")
-        last_request = time.monotonic()
+    lines = read_serial_lines()
+    if lines:
+        type_code(lines)
+    time.sleep(0.1)
